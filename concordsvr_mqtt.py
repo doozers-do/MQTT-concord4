@@ -21,15 +21,17 @@ Developed from py-concord Copyright (c) 2013, Douglas S. J. De Couto, decouto@al
 
 """
 
-import os
+# import os
 import sys
 import time
+# import pprint
 from threading import Thread
+from threading import Timer
 from collections import deque
 import datetime
-import traceback
-import string
-import base64
+# import traceback
+# import string
+# import base64
 import logging,logging.handlers
 import ConfigParser
 import paho.mqtt.client as mqtt
@@ -78,32 +80,6 @@ def logger(message, level = 'info'):
         log.warn(message)
 
 #
-# Send e-mail over GMAIL
-#
-def send_email(user, pwd, recipient, subject, body):
-    import smtplib
-
-    gmail_user = user
-    gmail_pwd = pwd
-    FROM = user
-    TO = recipient if type(recipient) is list else [recipient]
-    SUBJECT = subject
-    TEXT = body
-
-    # Prepare actual message
-    message = """From: %s\nTo: %s\nSubject: %s\n\n%s
-    """ % (FROM, ", ".join(TO), SUBJECT, TEXT)
-    try:
-        server_ssl = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-        server_ssl.ehlo()
-        server_ssl.login(gmail_user, gmail_pwd)
-        server_ssl.sendmail(FROM, TO, message)
-        server_ssl.close()
-        log.info("E-mail notification sent")
-    except Exception, ex:
-        log.error("E-mail notification failed to send: %s" % str(ex))
-
-#
 # Send an MQTT update. This has to be on the main thread due to some sort of bug in the MQTT library
 #
 def send_mqtt_update(topic, value):
@@ -137,10 +113,12 @@ def isZoneErrState(state_list):
     return False
 
 def zoneStateChangedExceptTripped(old, new):
-    old = list(sorted(old)).remove(TRIPPED)
-    new = list(sorted(new)).remove(TRIPPED)
-    return old != new
-    
+    try:
+        old = list(sorted(old)).remove(TRIPPED)
+        new = list(sorted(new)).remove(TRIPPED)
+        return old != new
+    except:
+        return True
 
 #
 # Touchpad display when no data available
@@ -151,13 +129,12 @@ NO_DATA = '<NO DATA>'
 # Keypad sequences for various actions
 #
 KEYPRESS_SILENT = [ 0x05 ]
-KEYPRESS_ARM_STAY = [ 0x28 ]
-KEYPRESS_ARM_AWAY = [ 0x27 ]
-KEYPRESS_ARM_STAY_LOUD = [ 0x02 ]
-KEYPRESS_ARM_AWAY_LOUD = [ 0x03 ]
+KEYPRESS_ARM_STAY = [ 0x02 ]
+KEYPRESS_ARM_AWAY = [ 0x03 ]
 KEYPRESS_DISARM = [ 0x20 ]
 KEYPRESS_BYPASS = [ 0xb ] # '#'
 KEYPRESS_TOGGLE_CHIME = [ 7, 1 ]
+KEYPRESS_INSTANT = [ 0x04 ]
 
 KEYPRESS_EXIT_PROGRAM = [ STAR, 0, 0, HASH ]
 
@@ -202,16 +179,26 @@ PART_ARM_STATE_MAP = {
 
 # Custom dictionary to give friendly names to zones for display
 FRIENDLY_ZONE_NAME_MAP = {
-    1: "Front Door",
-    2: "Back Door",
-    3: "Garage Interior Door",
-    4: "Main Floor Glass Break",
-    5: "Basement Sliding Glass Door",
-    6: "Basement Windows",
-    7: "Basement Glass Break",
+    1: "Front And Laundry",
+    2: "Garage",
+    3: "Sliding Glass Doors",
+    4: "Master Exterior Door",
+    5: "Master Motion",
+    6: "Living Room Motion",
     8: "Smoke / CO2 Alarm",
-    9: "Key Fob 1",
-    10: "Key Fob 2"
+    9: "Closet",
+    10: "Master Window 1",
+    11: "Master Window 2",
+    12: "Master Bath 1",
+    13: "Master Bath 2",
+    14: "Office",
+    15: "Dining Window",
+    16: "SW Bedroom Window",
+    17: "W Bedroom Window",
+    18: "NW Bath Window",
+    19: "NW Bedroom Window 1",
+    20: "NW Bedroom Window 2",
+    21: "Kitchen Water Sensor"
 }
 
 class Concord4ServerConfig():
@@ -224,9 +211,6 @@ class Concord4ServerConfig():
         self.LOGLEVEL = self.read_config_var('main', 'loglevel', '', 'str')
         self.HOST = self.read_config_var('main', 'host', '', 'str')
         self.PORT = self.read_config_var('main', 'port', 1883, 'int')
-        self.EMAILSENDER = self.read_config_var('main', 'emailsender', '', 'str')
-        self.EMAILPASSWORD = self.read_config_var('main', 'emailpassword', '', 'str')
-        self.EMAILRECIPIENT = self.read_config_var('main', 'emailrecipient', '', 'str')
         self.MQTTUSER = self.read_config_var('main', 'mqttuser', '', 'str')
         self.MQTTPASSWORD = self.read_config_var('main', 'mqttpassword', '', 'str')
 
@@ -261,6 +245,7 @@ class ConcordSvr(object):
         self.StopThread = False
         self.armed = None
         self.serialPortUrl = config.SERIALPORT
+        self.timer = None
 
         # Zones are keyed by (partitition number, zone number)
         self.zones = { } # zone key -> dict of zone info, i.e. output of cmd_zone_data
@@ -312,18 +297,6 @@ class ConcordSvr(object):
         event_time = datetime.datetime.now()
         self._logEvent(eventInfo, event_time, self.eventLog, self.eventLogDays)
 
-        # Send an e-mail if we're armed and we have a zone update
-        # This would mean the alarm has detected something
-        if self.armed and 'zone_name' in eventInfo and len(eventInfo['zone_state']) > 0:
-            email_subject = "--- ALARM EVENT: ZONE " + eventInfo['zone_name']
-            email_message = "NEW STATE: " + str(eventInfo['zone_state']) + "\nPREVIOUS STATE: " + str(eventInfo['prev_zone_state']) + "\nCOMMAND: " + str(eventInfo['command'] + "\nDATE: " + str(event_time))
-            log.info("Sending Email... ")
-            log.debug("Email Contents:" + email_subject + "\n" + email_message)
-            send_email(config.EMAILSENDER.decode('base64'), config.EMAILPASSWORD.decode('base64'), config.EMAILRECIPIENT.decode('base64'), email_subject, email_message)
-
-            # Update MQTT
-            self.updateStateOnMQTT('alarm','triggered')
-
         if isErr:
             self._logEvent(eventInfo, event_time, self.errLog, self.errLogDays)
 
@@ -352,7 +325,7 @@ class ConcordSvr(object):
     def startup(self):
         try:
             self.panel = concord.AlarmPanelInterface(self.serialPortUrl, 0.5, log)
-        except Exception, ex:
+        except Exception as ex:
             self.updateStateOnServer("panel","state", "faulted")
             log.error("Unable to start alarm panel interface: %s" % str(ex))
             return
@@ -397,7 +370,7 @@ class ConcordSvr(object):
     def send_key_press(self,code=[],partition_num=1):
         try:
             self.panel.send_keypress(code, partition_num)
-        except Exception, ex:
+        except Exception as ex:
             log.error("Problem trying to send key=%s" % \
                                   (str(code)))
             log.error(str(ex))
@@ -425,16 +398,13 @@ class ConcordSvr(object):
         if arm_silent and 'disarm' not in action:
             keys += KEYPRESS_SILENT
         if action == 'stay':
-            if not arm_silent:
-                keys += KEYPRESS_ARM_STAY_LOUD
-            else:
-                keys += KEYPRESS_ARM_STAY
+            keys += KEYPRESS_ARM_STAY
+            if arm_silent:
+                keys += KEYPRESS_INSTANT
         elif action == 'away':
-            if not arm_silent:
-                keys += KEYPRESS_ARM_AWAY_LOUD
-            else:
-                keys += KEYPRESS_ARM_AWAY
+            keys += KEYPRESS_ARM_AWAY
         elif action == 'disarm':
+            keys += KEYPRESS_SILENT
             keys += KEYPRESS_DISARM
         else:
             pass
@@ -445,7 +415,7 @@ class ConcordSvr(object):
             keys += KEYPRESS_BYPASS
         try:
             self.panel.send_keypress(keys, partition_num)
-        except Exception, ex:
+        except Exception as ex:
             log.error("Problem trying to arm action=%s, silent=%s, bypass=%s" % \
                                   (action, str(arm_silent), str(bypasszone)))
             log.error(str(ex))
@@ -533,7 +503,7 @@ class ConcordSvr(object):
     def panelMessageHandler(self, msg):
         """ *msg* is dict with received message from the panel. """
         cmd_id = msg['command_id']
-
+        # pprint.pprint(msg)
         # Log about the message, but not for the ones we hear all the
         # time.  Chatterbox!
         if cmd_id in ('TOUCHPAD', 'SIREN_SYNC'):
@@ -554,9 +524,7 @@ class ConcordSvr(object):
             self.updateStateOnServer('panel','panelSerialNumber', msg['serial_number'])
             self.updateStateOnServer('panel','panelHwRev', msg['hardware_revision'])
             self.updateStateOnServer('panel','panelSwRev', msg['software_revision'])
-            #self.updateStateOnServer('panel','panelZoneMonitorEnabled', self.zoneMonitorEnabled)
-            #self.updateStateOnServer('panel','panelZoneMonitorSendEmail', self.zoneMonitorSendEmail)
-
+         
         elif cmd_id in ('ZONE_DATA', 'ZONE_STATUS'):
             # First update our internal state about the zone
             zone_num = msg['zone_number']
@@ -637,7 +605,8 @@ class ConcordSvr(object):
                 log.info('System is ARMED to STAY')
                 self.armed = True
                 self.updateStateOnServer('armstatus','arm_level','armed_stay')
-                self.updateStateOnMQTT('alarm','armed_home')
+                self.timer = Timer(3.0, self.updateStateOnMQTT,('alarm','armed_home'))
+                self.timer.start()
             elif int(msg['arming_level_code']) == 3:
                 log.info('System is ARMED to AWAY')
                 self.armed = True
@@ -655,6 +624,14 @@ class ConcordSvr(object):
                 # so log at a higher level.
                 if cmd_id == 'TOUCHPAD':
                     log_fn = log.debug
+                elif cmd_id == "FEAT_STATE" and 'No delay' in msg['feature_state']:
+                    try :
+                        self.timer.cancel()
+                    except:
+                        log.debug("unable to cancel staged update")
+                    finally:    
+                        self.updateStateOnServer('armstatus','arm_level','armed_night')
+                        self.updateStateOnMQTT('alarm','armed_night') 
                 else:
                     log_fn = log.info
                 log.debug("Updating partition %d with %s message" % (part_num, cmd_id))
@@ -721,12 +698,12 @@ class ConcordSvr(object):
             part_num = msg['partition_number']
             source_type = msg['source_type']
             source_num = msg['source_number']
-            alarm_code_str ="%d.%d" % (msg['alarm_general_type_code'], msg['alarm_specific_type_code'])
-            alarm_desc = "%s / %s" % (msg['alarm_general_type'], msg['alarm_specific_type'])
-            event_data = msg['event_specific_data']
+            # alarm_code_str ="%d.%d" % (msg['alarm_general_type_code'], msg['alarm_specific_type_code'])
+            # alarm_desc = "%s / %s" % (msg['alarm_general_type'], msg['alarm_specific_type'])
+            # event_data = msg['event_specific_data']
 
-            # We really only care if its of gen type 1 (fire,police, etc)
-            if msg['alarm_general_type_code'] == '1':
+            # We really only care if its of gen type 1
+            if msg['alarm_general_type_code'] == 1:
                 zk = (part_num, source_num)
                 if source_type == 'Zone' and zk in self.zones:
                     zone_name = self.zones[zk].get('zone_text', 'Unknown')
@@ -740,7 +717,7 @@ class ConcordSvr(object):
                 log.error("ALARM or TROUBLE on partition %d: Source details: %s" % (part_num, source_desc))
 
                 self.updateStateOnServer('panel','state','alarm')
-
+                self.updateStateOnMQTT('alarm','triggered')
 
                 msg['source_desc'] = source_desc
                 self.logEvent(msg, True)
@@ -847,6 +824,9 @@ class ConcordMQTT(object):
             elif value == 'arm_away':
                 concord_interface.ArmDisarm(action='away')
                 logger("MQTT - Arming System to AWAY...")
+            elif value == 'arm_night':
+                concord_interface.ArmDisarm(action='stay', arm_silent = True)
+                logger("MQTT - Arming System to NIGHT...")
             elif value == 'disarm':
                 concord_interface.ArmDisarm(action='disarm')
                 logger("MQTT - Disarm System...")
@@ -885,7 +865,7 @@ if __name__ == '__main__':
                 mqttMessageQueue = []
 
     except KeyboardInterrupt:
-        print "Crtl+C pressed. Shutting down."
+        print("Crtl+C pressed. Shutting down.")
         logger('Shutting down from Ctrl+C')
         concord_mqtt.end()
         concord_panel_thread.panel = None
